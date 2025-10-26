@@ -3,12 +3,15 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 //Title Kipubank
 //@author Nehuen
 //@notice Simple banking for ETH deposits with personal vaults, global limit and immutable withdrawal limit.
 //@dev checks-effects-interactions, use of modifiers and secure native transfers
 contract KipuBank is AccessControl{
+using SafeERC20 for IERC20;
 
 //@notice Error notice when 0 is sent as quantity
 error kipuZeroAmount();
@@ -37,17 +40,21 @@ error kipuNativeTransferFailed(address to, uint256 amount);
 bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
 //@notice Role for users who can perform deposit and withdrawal personal vaults
 bytes32 public constant USER_ROLE = keccak256("USER_ROLE");
+//@notice Role for multitoken support
+bytes32 public constant TOKEN_MANAGE_ROLE = keccak256("TOKKEN_MANAGE_ROLE");
 
 //@notice Limit global max of ETH that the contract accepts as a deposit
 uint256 public immutable bankCap;
-
 //@notice Maximum withdrawal limit in a single transaction
 uint256 public immutable withdrawalLimit;
 
 //@notice Total accumulated balance stored in the contract
 uint256 public totalBanked;
-//@notice Balance per user: address=>balance in wei
-mapping(address=>uint256) private _balances;
+//@notice ethbalances per user: address=>balance in wei
+mapping(address=>uint256) private _ethbalances;
+//@notice tokenbalances per user: token=>user=>amount
+mapping(address=>mapping(address=>uint256)) private _tokenBalances;
+
 //@notice Total successful deposit counter
 uint256 public depositCount;
 //@notice Total succesful withdrawal counter
@@ -59,12 +66,26 @@ uint256 public withrawalCount;
 //@param newBalance New quantity in the personal vault 
 //@param depositId Incremental deposit identifier
 event Deposit(address indexed user, uint256 amount, uint256 newBalance, uint256 depositId);
+//@notice Event issued after a successful deposit in tokens
+//@param token
+//@param user Deposit address
+//@param amount Deposit quantity
+//@param newBalance New quantity in the personal vault 
+//@param depositId Incremental deposit identifier
+event DepositToken(address indexed token, address indexed user, uint256 amount, uint256 newBalance, uint256 depositId);
 //@notice Event issued after a successful withdrawal
 //@param user Withdrawal address
 //@param amount Withdrawal quantity
 //@param newBalance New quantity in the personal vault
 //@param withdrawalId Incremental withdrawal idenitifier
 event withdrawal(address indexed user, uint256 amount, uint256 newBalance, uint256 withdrawalId);
+//@notice Event issued after a successful withdrawal
+//@param token
+//@param user Withdrawal address
+//@param amount Withdrawal quantity
+//@param newBalance New quantity in the personal vault
+//@param withdrawalId Incremental withdrawal idenitifier
+event withdrawalToken(address indexed token, address indexed user, uint256 amount, uint256 newBalance, uint256 depositId);
 //@notice Grant the user role and open the account
 //@param user Address user
 //@param openedBy Admin authorizing the opening
@@ -102,13 +123,13 @@ constructor(uint256 _bankCap, uint256 _withdrawalLimit) payable{
 
      if(msg.value>0){
         if(msg.value >bankCap) revert kipuBankCapExceeded(msg.value,bankCap);
-        _balances[msg.sender]=msg.value;
+        _ethbalances[msg.sender]=msg.value;
         totalBanked=msg.value;
         depositCount=1;
         //Grant user role to deployer so they can interact later
         _grantRole(USER_ROLE,msg.sender);
         emit AccountOpened(msg.sender, msg.sender);
-        emit Deposit(msg.sender,msg.value,_balances[msg.sender],depositCount);
+        emit Deposit(msg.sender,msg.value,_ethbalances[msg.sender],depositCount);
      }
 }
 
@@ -130,14 +151,24 @@ function closeAccount(address user) external onlyRole(DEFAULT_ADMIN_ROLE){
 //@return newBalance New user balance after deposit
 function deposit() external payable onlyRole(USER_ROLE) nonZero(msg.value) withinBankCap(msg.value) returns (uint256 newBalance){
     //Effects(updates states)
-    _balances[msg.sender] += msg.value;
+    _ethbalances[msg.sender] += msg.value;
     totalBanked+=msg.value;
     //increment counter deposits and emit event
     depositCount+=1;
-    newBalance=_balances[msg.sender];
+    newBalance=_ethbalances[msg.sender];
     emit Deposit(msg.sender,msg.value,newBalance,depositCount);
     return newBalance;
 }
+//@notice deposit ERC20 token
+function depositToken(address token, uint256 amount) external onlyRole(USER_ROLE) nonZero(amount) returns (uint256 newBalance){
+    IERC20(token).safeTransferFrom(msg.sender,address(this),amount);
+    _tokenBalances[token][msg.sender]+=amount;
+    depositCount+=1;
+    newBalance=_tokenBalances[token][msg.sender];
+    emit DepositToken(token,msg.sender,amount,newBalance,depositCount);
+    return newBalance;
+}
+
 //@notice Withdraws ETH from the sender vault up to the withdrawal limit
 //@dev Check requested>0, that requested <=withdrawalLimit and that the user has sufficient balanced
 //@param requested Withdrawal quantity
@@ -145,25 +176,39 @@ function deposit() external payable onlyRole(USER_ROLE) nonZero(msg.value) withi
 function  withdraw (uint256 requested) external onlyRole(USER_ROLE) nonZero(requested) returns(bool sent){
 //Checks withdrawal limit
 if(requested>withdrawalLimit) revert kipuWithdrawalLimitExceeded(requested,withdrawalLimit);
-uint256 userBalance = _balances[msg.sender];
+uint256 userBalance = _ethbalances[msg.sender];
 if(requested>userBalance) revert kipuInsufficentBalance(requested,userBalance);
-_balances[msg.sender]=userBalance-requested;
+_ethbalances[msg.sender]=userBalance-requested;
 totalBanked-=requested;
 
 withrawalCount+=1;
-uint256 newBalance=_balances[msg.sender];
+uint256 newBalance=_ethbalances[msg.sender];
 
 sent=_sendNative(payable(msg.sender),requested);
 if(!sent)revert kipuNativeTransferFailed(msg.sender,requested);
 emit withdrawal(msg.sender, requested, newBalance, withrawalCount);
 return true;
 }
+//@notice withraw ERC20 token
+function withdrawToken(address token, uint256 amount) external onlyRole(USER_ROLE) nonZero(amount) returns (bool){
+    uint256 val=_tokenBalances[token][msg.sender];
+    if(amount>val) revert kipuInsufficentBalance(amount,val);
+    _tokenBalances[token][msg.sender]=val-amount;
+    withrawalCount+=1;
+    IERC20(token).safeTransfer(msg.sender,amount);
+    emit withdrawalToken(token, msg.sender, amount, _tokenBalances[token][msg.sender], withrawalCount);
+    return true;
+}
 
 //@notice Balance of the vault of an address
 //@param account Address whose vault is consulted
 //@return balance Balance in wei
 function getBalance(address account) external view onlyRole(USER_ROLE) returns (uint256 balance){
-    return _balances[account];
+    return _ethbalances[account];
+}
+
+function getTokenBalance(address token, address account) external view onlyRole(USER_ROLE) returns (uint256 balance){
+    return _tokenBalances[token][account];
 }
 
 //@dev Private funcion that centralizes the native shipping logic
@@ -176,11 +221,20 @@ function _sendNative(address payable to, uint256 amount) private returns (bool s
 }
 //@notice Manager can credit users without needing them to call deposit
 function creditTo(address payable to, uint256 amount) external nonZero(amount) withinBankCap(amount) onlyRole(MANAGER_ROLE) returns(uint256 newBalance){
-    _balances[to]+=amount;
+    _ethbalances[to]+=amount;
     totalBanked+=amount;
     depositCount+=1;
-    newBalance=_balances[to];
+    newBalance=_ethbalances[to];
     emit Deposit(to,amount,newBalance,depositCount);
+    return newBalance;
+}
+
+function creditToken(address token, address to, uint256 amount) external nonZero(amount) onlyRole(MANAGER_ROLE) returns(uint256 newBalance){
+    IERC20(token).safeTransferFrom(msg.sender,address(this),amount);
+    _tokenBalances[token][to]+=amount;
+    depositCount+=1;
+    newBalance=_tokenBalances[token][to];
+    emit DepositToken(token, to, amount, newBalance, depositCount);
     return newBalance;
 }
 
